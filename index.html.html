@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Driver Assistant - Human Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <style>
+        body { margin: 0; padding: 0; background-color: #ffffff; color: #006400; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+        #container { position: relative; width: 100vw; height: 100vh; background: #111; }
+        video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+        canvas { z-index: 10; }
+        #ui { 
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 20; 
+            background: rgba(255, 255, 255, 0.95); border: 4px solid #2e7d32; border-radius: 15px; 
+            padding: 15px; text-align: center; width: 90%; max-width: 400px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); 
+        }
+        h1 { margin: 0 0 5px 0; font-size: 20px; color: #2e7d32; text-transform: uppercase; }
+        #status { font-size: 22px; font-weight: bold; margin-bottom: 5px; padding: 8px; border-radius: 8px; }
+        #distance-display { font-size: 16px; font-weight: 600; margin-bottom: 10px; }
+        .status-safe { background-color: #c8e6c9; color: #2e7d32; }
+        .status-warning { background-color: #fff9c4; color: #f57f17; }
+        .status-danger { background-color: #ffcdd2; color: #c62828; animation: pulse 1s infinite; }
+        
+        @keyframes pulse { 
+            0% { transform: scale(1); }
+            50% { transform: scale(1.02); background-color: #f44336; color: white; }
+            100% { transform: scale(1); }
+        }
+        
+        .controls { display: flex; gap: 10px; margin-bottom: 10px; }
+        button { 
+            flex: 1; background-color: #2e7d32; color: white; border: none; 
+            padding: 10px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; 
+        }
+        button:disabled { background-color: #9e9e9e; cursor: not-allowed; }
+        button:active:not(:disabled) { background-color: #1b5e20; }
+        
+        .toggles { display: flex; justify-content: space-around; font-size: 13px; font-weight: bold; color: #333; }
+        label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+        <div id="ui">
+            <h1>ADAS Pro</h1>
+            <div id="status" class="status-safe">System Ready</div>
+            <div id="distance-display">Nearest Obstacle: -- m</div>
+            
+            <div class="controls">
+                <button id="btn-start">Start Camera</button>
+                <button id="btn-calibrate" disabled>Calibrate Bumper</button>
+            </div>
+            
+            <div class="toggles">
+                <label><input type="checkbox" id="chk-pitch" checked> Dynamic Pitch</label>
+                <label><input type="checkbox" id="chk-vision" checked> Restrict Vision</label>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const distanceEl = document.getElementById('distance-display');
+        const startBtn = document.getElementById('btn-start');
+        const calibrateBtn = document.getElementById('btn-calibrate');
+        
+        const chkPitch = document.getElementById('chk-pitch');
+        const chkVision = document.getElementById('chk-vision');
+        
+        let model = null;
+        let isDetecting = false;
+        let stream = null;
+        let audioCtx;
+        
+        let baseHorizonY = 0.4; 
+        let dynamicHorizonY = 0.4;
+        let bumperY = 0.95; 
+        let baseTilt = null; 
+        
+        const REAL_HEIGHTS_M = { 'person': 1.7 };
+        const FOCAL_LENGTH = 600;
+
+        function initAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        function playBeep() {
+            if (!audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.frequency.setValueAtTime(800, audioCtx.currentTime); 
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.2);
+        }
+
+        window.addEventListener('deviceorientation', (event) => {
+            if (!chkPitch.checked || !event.beta) return;
+            const tilt = event.beta; 
+            if (baseTilt === null) baseTilt = tilt; 
+            const tiltDiff = tilt - baseTilt;
+            dynamicHorizonY = Math.max(0.2, Math.min(0.8, baseHorizonY + (tiltDiff * 0.01)));
+        });
+
+        async function startSystem() {
+            initAudio();
+            startBtn.innerText = 'Loading Model...';
+            startBtn.disabled = true;
+            
+            if (!model) model = await cocoSsd.load();
+            
+            stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+            video.srcObject = stream;
+            
+            await new Promise(resolve => { video.onloadedmetadata = () => resolve(); });
+            video.play();
+            
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            
+            isDetecting = true;
+            startBtn.innerText = 'Stop System';
+            startBtn.disabled = false;
+            calibrateBtn.disabled = false;
+            
+            detectFrame();
+        }
+
+        function stopSystem() {
+            isDetecting = false;
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            statusEl.className = 'status-safe';
+            statusEl.innerText = 'System Stopped';
+            startBtn.innerText = 'Start Camera';
+            calibrateBtn.disabled = true;
+        }
+
+        calibrateBtn.addEventListener('click', () => {
+            calibrateBtn.innerText = 'Calibrated!';
+            setTimeout(() => calibrateBtn.innerText = 'Calibrate Bumper', 2000);
+            baseTilt = null; 
+            bumperY = 0.90; 
+            baseHorizonY = dynamicHorizonY; 
+        });
+
+        startBtn.addEventListener('click', () => {
+            if (!isDetecting) startSystem();
+            else stopSystem();
+        });
+
+        function isPointInTrapezoid(px, py, cw, ch) {
+            if (!chkVision.checked) return true; 
+            
+            const hzY = dynamicHorizonY * ch;
+            const bmpY = bumperY * ch;
+            
+            if (py < hzY || py > bmpY) return false;
+            
+            const topWidth = cw * 0.2;  
+            const bottomWidth = cw * 0.8; 
+            
+            const progress = (py - hzY) / (bmpY - hzY); 
+            const currentWidth = topWidth + progress * (bottomWidth - topWidth);
+            const centerX = cw / 2;
+            
+            return (px >= centerX - currentWidth/2 && px <= centerX + currentWidth/2);
+        }
+
+        async function detectFrame() {
+            if (!isDetecting) return;
+            
+            const cw = canvas.width;
+            const ch = canvas.height;
+            const hzY = dynamicHorizonY * ch;
+            const bmpY = bumperY * ch;
+            
+            ctx.clearRect(0, 0, cw, ch);
+            
+            ctx.strokeStyle = chkPitch.checked ? 'rgba(0, 255, 0, 0.5)' : 'rgba(255, 255, 255, 0.3)';
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(0, hzY);
+            ctx.lineTo(cw, hzY);
+            ctx.stroke();
+            
+            if (chkVision.checked) {
+                ctx.strokeStyle = 'rgba(255, 255, 0, 0.3)';
+                ctx.beginPath();
+                ctx.moveTo(cw/2 - cw*0.1, hzY);
+                ctx.lineTo(cw/2 + cw*0.1, hzY);
+                ctx.lineTo(cw/2 + cw*0.4, bmpY);
+                ctx.lineTo(cw/2 - cw*0.4, bmpY);
+                ctx.closePath();
+                ctx.stroke();
+                
+                ctx.fillStyle = 'rgba(0,0,0,0.4)';
+                ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(cw,0); ctx.lineTo(cw,ch); ctx.lineTo(0,ch); ctx.closePath();
+                ctx.moveTo(cw/2 - cw*0.1, hzY); ctx.lineTo(cw/2 + cw*0.1, hzY); ctx.lineTo(cw/2 + cw*0.4, bmpY); ctx.lineTo(cw/2 - cw*0.4, bmpY); ctx.closePath();
+                ctx.fill("evenodd");
+            }
+            
+            ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
+            ctx.setLineDash([]);
+            ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(0, bmpY); ctx.lineTo(cw, bmpY); ctx.stroke();
+            ctx.fillStyle = 'red';
+            ctx.font = '14px Arial';
+            ctx.fillText('CAR BUMPER (0m)', 10, bmpY - 5);
+            
+            const predictions = await model.detect(video);
+            let closestDistance = Infinity;
+            
+            predictions.forEach(pred => {
+                if (pred.class === 'person') {
+                    const [x, y, w, h] = pred.bbox;
+                    const scaleY = ch / video.videoHeight;
+                    const bottomPointX = x + (w/2);
+                    const bottomPointY = (y + h) * scaleY;
+                    
+                    if (!isPointInTrapezoid(bottomPointX, bottomPointY, cw, ch)) return;
+                    
+                    const realHeight = REAL_HEIGHTS_M['person'];
+                    let dist = (realHeight * FOCAL_LENGTH) / (h * scaleY);
+                    
+                    const groundProgress = (bmpY - bottomPointY) / (bmpY - hzY);
+                    if (groundProgress < 0) dist = 0.5; 
+                    
+                    if (dist < closestDistance) closestDistance = dist;
+                    
+                    ctx.strokeStyle = '#2e7d32';
+                    ctx.strokeRect(x, y, w, h);
+                    
+                    const label = `Human (${dist.toFixed(1)}m)`;
+                    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+                    ctx.fillRect(x, y - 24, ctx.measureText(label).width + 10, 24);
+                    ctx.fillStyle = '#006400';
+                    ctx.fillText(label, x + 5, y - 6);
+                }
+            });
+            
+            updateStatus(closestDistance);
+            requestAnimationFrame(detectFrame);
+        }
+        
+        let lastBeep = 0;
+        function updateStatus(distance) {
+            const now = Date.now();
+            if (distance === Infinity) {
+                statusEl.innerText = 'Path Clear';
+                statusEl.className = 'status-safe';
+                distanceEl.innerText = `Nearest Obstacle: -- m`;
+                return;
+            }
+
+            distanceEl.innerText = `Nearest Obstacle: ${distance.toFixed(1)} m`;
+
+            if (distance < 3.0) {
+                statusEl.innerText = 'BRAKE NOW!';
+                statusEl.className = 'status-danger';
+                if (now - lastBeep > 400) { playBeep(); lastBeep = now; }
+            } else if (distance < 8.0) {
+                statusEl.innerText = 'Prepare to Brake';
+                statusEl.className = 'status-warning';
+            } else {
+                statusEl.innerText = 'Safe Distance';
+                statusEl.className = 'status-safe';
+            }
+        }
+    </script>
+</body>
+</html>
